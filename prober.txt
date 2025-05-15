@@ -1,0 +1,168 @@
+#!/usr/bin/env python3
+import sys
+import time
+import datetime
+from pysnmp.hlapi import *
+
+# Constants
+SYSUPTIME_OID = '1.3.6.1.2.1.1.3.0'
+MAX_32BIT = 2**32
+MAX_64BIT = 2**64
+
+def parse_agent(agent_str):
+    """Parse 'IP:port:community' into (ip, port, community)."""
+    parts = agent_str.split(':')
+    if len(parts) != 3:
+        print(f"Error: Agent must be in IP:port:community format. Got '{agent_str}'")
+        sys.exit(1)
+    ip, port, community = parts
+    return ip, int(port), community
+
+def snmp_get_bulk(ip, port, community, oids, timeout=1, retries=0):
+    """SNMP GET multiple OIDs, return {oid: int_value} or None on error."""
+    iterator = getCmd(
+        SnmpEngine(),
+        CommunityData(community, mpModel=1),  # SNMPv2c
+        UdpTransportTarget((ip, port), timeout=timeout, retries=retries),
+        ContextData(),
+        *[ObjectType(ObjectIdentity(oid)) for oid in oids]
+    )
+    errorIndication, errorStatus, errorIndex, varBinds = next(iterator)
+    if errorIndication or errorStatus:
+        return None
+    results = {}
+    for varBind in varBinds:
+        oid_str = str(varBind[0])
+        val = varBind[1]
+        try:
+            intval = int(val)
+        except:
+            intval = int(str(val))
+        results[oid_str] = intval
+    return results
+
+def counter_diff(prev, curr, max_val):
+    """Calculate difference between counters with wrap-around support."""
+    if curr >= prev:
+        return curr - prev
+    else:
+        return (max_val - prev) + curr
+
+def print_rates(timestamp, rates):
+    """Print timestamp and rates separated by ' | '."""
+    line = f"{timestamp}"
+    for r in rates:
+        line += f" | {r}"
+    print(line)
+    sys.stdout.flush()
+
+def main():
+    if len(sys.argv) < 5:
+        print("Usage: prober.py <Agent IP:port:community> <sample frequency Hz> <samples> <OID1> [OID2] ... [OIDn]")
+        sys.exit(1)
+
+    agent_str = sys.argv[1]
+    fs = float(sys.argv[2])
+    samples = int(sys.argv[3])
+    oids = sys.argv[4:]
+
+    # Ensure sysUpTime OID is included to detect resets
+    if SYSUPTIME_OID not in oids:
+        oids = [SYSUPTIME_OID] + oids
+
+    ip, port, community = parse_agent(agent_str)
+
+    if samples != -1 and samples < 2:
+        print("Samples must be >= 2 or -1 for infinite.")
+        sys.exit(1)
+
+    prev_vals = None
+    prev_sysuptime = None
+    prev_time = None
+
+    sysuptime_index = oids.index(SYSUPTIME_OID)
+    interval = 1.0 / fs
+
+    running = True
+    rates_printed = 0
+    next_sample_time = time.monotonic()
+
+    while running:
+        now = time.monotonic()
+        if now < next_sample_time:
+            time.sleep(next_sample_time - now)
+
+        sample_timestamp = int(time.time())
+        results = snmp_get_bulk(ip, port, community, oids)
+
+        if results is None:
+            # Timeout or error, skip sample but keep schedule
+            next_sample_time += interval
+            continue
+
+        sys_uptime_val = results.get(SYSUPTIME_OID)
+        if sys_uptime_val is None:
+            next_sample_time += interval
+            continue
+
+        # Debug print sysUpTime values
+       # if prev_sysuptime is not None:
+           # print(f"Debug: prev sysUpTime={prev_sysuptime}, curr sysUpTime={sys_uptime_val}")
+            # sys.stdout.flush()
+
+        if prev_vals is None:
+            # First sample: store and skip rate calculation
+            prev_vals = results
+            prev_sysuptime = sys_uptime_val
+            prev_time = sample_timestamp
+            next_sample_time += interval
+            continue
+
+        # Detect agent reset (sysUpTime decreased)
+        if sys_uptime_val < prev_sysuptime:
+            print(f"Agent has RESET at {datetime.datetime.now().isoformat()}")
+            sys.stdout.flush()
+            prev_vals = results
+            prev_sysuptime = sys_uptime_val
+            prev_time = sample_timestamp
+            rates_printed = 0
+            next_sample_time += interval
+            continue
+
+        # Calculate elapsed time in seconds (sysUpTime in hundredths)
+        time_diff_hundredths = sys_uptime_val - prev_sysuptime
+        time_diff = time_diff_hundredths / 100.0
+        if time_diff <= 0:
+            time_diff = interval  # fallback
+
+        rates = []
+        for i, oid in enumerate(oids):
+            if i == sysuptime_index:
+                continue  # skip sysUpTime
+
+            prev_val = prev_vals.get(oid)
+            curr_val = results.get(oid)
+            if prev_val is None or curr_val is None:
+                rates.append(0)
+                continue
+
+            max_val = MAX_64BIT if prev_val > MAX_32BIT or curr_val > MAX_32BIT else MAX_32BIT
+            diff = counter_diff(prev_val, curr_val, max_val)
+            rate = diff / time_diff
+            rates.append(int(rate))
+
+        print_rates(sample_timestamp, rates)
+
+        prev_vals = results
+        prev_sysuptime = sys_uptime_val
+        prev_time = sample_timestamp
+
+        rates_printed += 1
+        if samples != -1 and rates_printed >= samples:
+            running = False
+
+        next_sample_time += interval
+
+if __name__ == '__main__':
+    main()
+
